@@ -22,13 +22,6 @@ class TorrentStreamServer(private val saveDir: File) {
     @Volatile
     private var totalFileSize: Long = 0L
 
-    // The byte offset of the served file within the torrent.
-    // CRITICAL for multi-file torrents: a file-relative offset of 0
-    // does NOT correspond to torrent piece 0. We need this offset
-    // to correctly map file positions to torrent-wide piece indices.
-    @Volatile
-    private var fileByteOffset: Long = 0L
-
     private val executor = Executors.newCachedThreadPool { r ->
         Thread(r, "stream-client").also { it.isDaemon = true }
     }
@@ -49,22 +42,11 @@ class TorrentStreamServer(private val saveDir: File) {
         totalFileSize = size
     }
 
-    /**
-     * Set the byte offset of this file within the torrent.
-     * For single-file torrents this is 0.
-     * For multi-file torrents, this is the sum of all file sizes
-     * before this file. Needed to map file positions to torrent
-     * piece indices for piece availability checking.
-     */
-    fun setFileByteOffset(offset: Long) {
-        fileByteOffset = offset
-    }
-
     fun start(port: Int = 0): Int {
         serverSocket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
         running = true
         val actualPort = serverSocket!!.localPort
-        Log.d(TAG, "Server started on port $actualPort, totalFileSize=$totalFileSize, fileByteOffset=$fileByteOffset")
+        Log.d(TAG, "Server started on port $actualPort")
         thread(name = "stream-server") {
             while (running) {
                 try {
@@ -82,13 +64,6 @@ class TorrentStreamServer(private val saveDir: File) {
         running = false
         executor.shutdownNow()
         try { serverSocket?.close() } catch (_: Exception) {}
-    }
-
-    /**
-     * Convert a file-relative byte offset to a torrent-wide piece index.
-     */
-    private fun fileOffsetToPieceIndex(fileOffset: Long): Int {
-        return ((fileByteOffset + fileOffset) / pieceSize).toInt()
     }
 
     private fun handleClient(client: Socket) {
@@ -116,25 +91,26 @@ class TorrentStreamServer(private val saveDir: File) {
 
             Log.d(TAG, "$method $requestPath, Range: ${headers["range"] ?: "none"}")
 
-            // Wait for the file to appear on disk
+            // Wait for the file to appear on disk (up to 60 seconds)
             if (!file.exists()) {
-                Log.d(TAG, "File not found yet, waiting: $relativePath")
                 val waitDeadline = System.nanoTime() + 60_000_000_000L
-                while (!file.exists() && System.nanoTime() < waitDeadline && running) {
-                    try { Thread.sleep(300) } catch (_: InterruptedException) { break }
+                while (System.nanoTime() < waitDeadline && running) {
+                    if (file.exists()) break
+                    try { Thread.sleep(200) } catch (_: InterruptedException) { break }
                 }
                 if (!file.exists()) {
-                    Log.w(TAG, "File still not found after waiting: $relativePath")
+                    Log.w(TAG, "File not found after waiting: $relativePath (base=$saveDir)")
                     sendError(client, 404, "Not Found")
                     return
                 }
-                Log.d(TAG, "File appeared on disk: $relativePath")
+                Log.d(TAG, "File appeared after waiting: $relativePath")
             }
 
+            // Use totalFileSize from metadata if available
             val fileLength = if (totalFileSize > 0) totalFileSize else file.length()
             if (fileLength <= 0) {
-                Log.w(TAG, "Cannot determine file size: totalFileSize=$totalFileSize, file.length()=${file.length()}")
-                sendError(client, 500, "Unknown file size")
+                Log.w(TAG, "Empty file: $relativePath (disk=${file.length()}, meta=$totalFileSize)")
+                sendError(client, 500, "Empty file")
                 return
             }
 
@@ -167,27 +143,20 @@ class TorrentStreamServer(private val saveDir: File) {
             }
 
             if (method == "HEAD") {
-                val resp = buildHeaders(
-                    if (isRange) 206 else 200,
-                    endOffset - startOffset + 1,
-                    file.name, isRange, startOffset, endOffset, fileLength
-                )
+                val resp = buildHeaders(if (isRange) 206 else 200, endOffset - startOffset + 1, file.name, isRange, startOffset, endOffset, fileLength)
                 client.getOutputStream().write(resp.toByteArray())
                 client.getOutputStream().flush()
                 client.close()
                 return
             }
 
-            // Before streaming, wait for requested data to be available
             val safeNow = minOf(safeBytes(), fileLength)
             if (startOffset >= safeNow) {
-                val startPiece = fileOffsetToPieceIndex(startOffset)
-                val endPiece = fileOffsetToPieceIndex(minOf(endOffset, fileLength - 1))
-                if (pieceChecker?.invoke(startPiece) != true ||
-                    (startPiece != endPiece && pieceChecker?.invoke(endPiece) != true)
-                ) {
-                    Log.d(TAG, "Data not yet available at file offset $startOffset (torrent piece $startPiece), waiting up to 60s")
-                    val deadline = System.nanoTime() + 60_000_000_000L
+                val startPiece = (startOffset / pieceSize).toInt()
+                val endPiece = (minOf(endOffset, fileLength - 1) / pieceSize).toInt()
+                if (pieceChecker?.invoke(startPiece) != true || (startPiece != endPiece && pieceChecker?.invoke(endPiece) != true)) {
+                    Log.w(TAG, "Piece not available for range $startOffset-$endOffset, blocking for up to 30s")
+                    val deadline = System.nanoTime() + 30_000_000_000L
                     var available = false
                     while (System.nanoTime() < deadline && running) {
                         val p = pieceChecker
@@ -198,21 +167,17 @@ class TorrentStreamServer(private val saveDir: File) {
                         try { Thread.sleep(100) } catch (_: InterruptedException) { break }
                     }
                     if (!available) {
-                        Log.w(TAG, "Timed out waiting for data at offset $startOffset")
                         sendError(client, 503, "Not yet available")
                         return
                     }
-                    Log.d(TAG, "Data became available after waiting")
+                    Log.d(TAG, "Piece became available after waiting")
                 }
             }
 
             val actualEnd = minOf(endOffset, fileLength - 1)
             val sendLength = actualEnd - startOffset + 1
 
-            val resp = buildHeaders(
-                if (isRange) 206 else 200,
-                sendLength, file.name, isRange, startOffset, actualEnd, fileLength
-            )
+            val resp = buildHeaders(if (isRange) 206 else 200, sendLength, file.name, isRange, startOffset, actualEnd, fileLength)
             val out = client.getOutputStream()
             out.write(resp.toByteArray())
 
@@ -227,25 +192,19 @@ class TorrentStreamServer(private val saveDir: File) {
                 while (remaining > 0 && running) {
                     val currentSafe = minOf(safeBytes(), fileLength)
                     var canRead: Long
-
                     if (pos < currentSafe) {
                         canRead = minOf(remaining, currentSafe - pos)
                     } else {
-                        // FIX: Use fileOffsetToPieceIndex to correctly map
-                        // file position to torrent-wide piece index
-                        val p = fileOffsetToPieceIndex(pos)
+                        val p = (pos / pieceSize).toInt()
                         if (pieceChecker?.invoke(p) == true) {
-                            val pieceStartInFile = (p.toLong() * pieceSize) - fileByteOffset
-                            val pieceEndInFile = ((p + 1).toLong() * pieceSize) - fileByteOffset
-                            val pieceEnd = minOf(pieceEndInFile, fileLength)
+                            val pieceEnd = ((p + 1) * pieceSize).coerceAtMost(fileLength)
                             canRead = minOf(remaining, pieceEnd - pos)
                         } else {
                             canRead = 0L
                         }
                     }
-
                     if (canRead <= 0) {
-                        if (System.nanoTime() - waitStart > 60_000_000_000L) {
+                        if (System.nanoTime() - waitStart > 30_000_000_000L) {
                             Log.w(TAG, "Stream timed out waiting for data at pos=$pos")
                             break
                         }
@@ -273,10 +232,7 @@ class TorrentStreamServer(private val saveDir: File) {
         }
     }
 
-    private fun buildHeaders(
-        status: Int, contentLen: Long, fileName: String,
-        isRange: Boolean, start: Long, end: Long, fileLen: Long
-    ): String {
+    private fun buildHeaders(status: Int, contentLen: Long, fileName: String, isRange: Boolean, start: Long, end: Long, fileLen: Long): String {
         val sb = StringBuilder()
         sb.append("HTTP/1.1 $status ${if (status == 206) "Partial Content" else "OK"}\r\n")
         sb.append("Content-Type: ${getMimeType(fileName)}\r\n")

@@ -15,7 +15,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.mkv.MatroskaExtractor
 import androidx.media3.ui.PlayerView
@@ -31,10 +31,10 @@ fun ExoPlayerVideoPlayer(
     val player = remember {
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 15_000,
-                /* maxBufferMs = */ 300_000,
-                /* bufferForPlaybackMs = */ 2_000,
-                /* bufferForPlaybackAfterRebufferMs = */ 5_000
+                /* minBufferMs */ 15000,
+                /* maxBufferMs */ 300000,
+                /* bufferForPlaybackMs */ 3000,
+                /* bufferForPlaybackAfterRebufferMs */ 10000
             )
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
@@ -48,13 +48,14 @@ fun ExoPlayerVideoPlayer(
         val extractorsFactory = DefaultExtractorsFactory()
             .setMatroskaExtractorFlags(MatroskaExtractor.FLAG_DISABLE_SEEK_FOR_CUES)
 
-        // Use DefaultMediaSourceFactory (not ProgressiveMediaSource)
-        // for better format auto-detection and compatibility
+        val mediaSourceFactory = ProgressiveMediaSource.Factory(
+            dataSourceFactory,
+            extractorsFactory
+        )
+
         ExoPlayer.Builder(context)
             .setLoadControl(loadControl)
-            .setMediaSourceFactory(
-                DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
-            )
+            .setMediaSourceFactory(mediaSourceFactory)
             .build()
             .also { exoPlayer ->
                 val mediaItem = MediaItem.fromUri(url)
@@ -64,14 +65,14 @@ fun ExoPlayerVideoPlayer(
                 exoPlayer.addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         when (playbackState) {
-                            Player.STATE_READY -> Log.d(TAG, "STATE_READY - playback started")
-                            Player.STATE_BUFFERING -> Log.d(TAG, "STATE_BUFFERING - waiting for data")
+                            Player.STATE_READY -> Log.d(TAG, "STATE_READY")
+                            Player.STATE_BUFFERING -> Log.d(TAG, "STATE_BUFFERING")
                             Player.STATE_ENDED -> Log.d(TAG, "STATE_ENDED")
                             Player.STATE_IDLE -> Log.d(TAG, "STATE_IDLE")
                         }
                     }
                     override fun onPlayerError(error: PlaybackException) {
-                        Log.e(TAG, "Player error: ${error.message}", error)
+                        Log.e(TAG, "Player error", error)
                     }
                 })
             }
