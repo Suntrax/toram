@@ -18,8 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class TorrentEngine(private val context: Context) {
 
     private val sessionManager = SessionManager()
-    private var rawHandle: org.libtorrent4j.swig.torrent_handle? = null
-    private var handle: TorrentHandle? = null
+    @Volatile private var rawHandle: org.libtorrent4j.swig.torrent_handle? = null
+    @Volatile private var handle: TorrentHandle? = null
     private val listeners = CopyOnWriteArrayList<EngineListener>()
     private var pollThread: Thread? = null
     private val isRunning = AtomicBoolean(false)
@@ -117,18 +117,23 @@ class TorrentEngine(private val context: Context) {
         val h = handle ?: run { Log.e(TAG, "handle is null in startDownload"); return }
         applyFilePriorities(h, fileIndex)
 
-        val deadlinePieceCount = 2
         val totalPieces = try { h.torrentFile()?.numPieces() ?: 0 } catch (_: Exception) { 0 }
 
         if (totalPieces > 0) {
             val lastPiece = totalPieces - 1
             rawHandle?.set_sequential_range(0, lastPiece)
 
-            val start = maxOf(0, totalPieces - deadlinePieceCount)
-            for (i in start until totalPieces) {
-                h.setPieceDeadline(i, 5000)
+            val headPieceCount = minOf(4, totalPieces)
+            for (i in 0 until headPieceCount) {
+                h.setPieceDeadline(i, 1)
             }
-            Log.d(TAG, "Set sequential range 0-$lastPiece, deadlines for pieces $start-$lastPiece")
+
+            val tailPieceCount = minOf(4, totalPieces)
+            val tailStart = maxOf(0, totalPieces - tailPieceCount)
+            for (i in tailStart until totalPieces) {
+                h.setPieceDeadline(i, 100)
+            }
+            Log.d(TAG, "Set sequential range 0-$lastPiece, head deadlines 0-${headPieceCount - 1}, tail deadlines $tailStart-$lastPiece")
         } else {
             rawHandle?.set_sequential_range(0, Int.MAX_VALUE)
             Log.w(TAG, "Unknown piece count, using Int.MAX_VALUE for sequential range")
@@ -167,6 +172,14 @@ class TorrentEngine(private val context: Context) {
         } catch (_: Exception) { null }
     }
 
+    fun getFileSize(fileIndex: Int): Long {
+        val h = handle ?: return 0L
+        return try {
+            val ti = h.torrentFile() ?: return 0L
+            ti.files().fileSize(fileIndex)
+        } catch (_: Exception) { 0L }
+    }
+
     fun getNumPieces(): Int {
         return try {
             handle?.torrentFile()?.numPieces() ?: 1
@@ -180,10 +193,85 @@ class TorrentEngine(private val context: Context) {
         return (total + np - 1) / np
     }
 
+    /**
+     * Returns the actual torrent piece length.
+     * This is different from getPieceSize() which returns an average.
+     */
+    fun getTorrentPieceLength(): Long {
+        val ti = try { handle?.torrentFile() } catch (_: Exception) { null } ?: return 4L * 1024 * 1024
+        return ti.pieceLength().toLong()
+    }
+
     fun havePiece(pieceIndex: Int): Boolean {
         return try {
             rawHandle?.have_piece(pieceIndex) ?: false
         } catch (_: Exception) { false }
+    }
+
+    /**
+     * Returns the byte offset of a file within the torrent.
+     * For file at index N, this sums up sizes of files 0..N-1.
+     * This is needed to map file-relative offsets to torrent-wide piece indices.
+     */
+    fun getFileByteOffset(fileIndex: Int): Long {
+        val ti = try { handle?.torrentFile() } catch (_: Exception) { null } ?: return 0L
+        val fs = ti.files()
+        var offset = 0L
+        for (i in 0 until fileIndex) {
+            offset += fs.fileSize(i)
+        }
+        return offset
+    }
+
+    /**
+     * Returns contiguous downloaded bytes from the START of the
+     * specified file. Works correctly for both single-file and
+     * multi-file torrents by calculating the file's piece range
+     * within the torrent.
+     *
+     * Key: for multi-file torrents, the selected file might not
+     * start at piece 0. Pieces before the file's first piece
+     * belong to other files (IGNORE priority) and will never be
+     * downloaded, so we must start counting from the file's
+     * own first piece.
+     */
+    fun getContiguousDownloadedBytes(fileIndex: Int): Long {
+        val h = handle ?: return 0L
+        val raw = rawHandle ?: return 0L
+        val ti = try { h.torrentFile() } catch (_: Exception) { null } ?: return 0L
+
+        val fs = ti.files()
+        val pieceLen = ti.pieceLength().toLong()
+        val fileSize = fs.fileSize(fileIndex)
+
+        if (fileSize <= 0) return 0L
+
+        // Calculate file's byte offset in the torrent
+        val fileByteOffset = getFileByteOffset(fileIndex)
+
+        // First and last piece that contain data for this file
+        val firstPiece = (fileByteOffset / pieceLen).toInt()
+        val lastPiece = ((fileByteOffset + fileSize - 1) / pieceLen).toInt()
+
+        // Walk from the file's first piece and check contiguity
+        var contiguousPieces = 0
+        for (i in firstPiece..lastPiece) {
+            try {
+                if (raw.have_piece(i)) {
+                    contiguousPieces++
+                } else {
+                    break
+                }
+            } catch (_: Exception) { break }
+        }
+
+        if (contiguousPieces == 0) return 0L
+
+        // Calculate how many file bytes are covered by contiguous pieces
+        val lastContiguousPiece = firstPiece + contiguousPieces - 1
+        val contiguousEndInTorrent = (lastContiguousPiece + 1).toLong() * pieceLen
+        val contiguousEndInFile = contiguousEndInTorrent - fileByteOffset
+        return minOf(contiguousEndInFile, fileSize)
     }
 
     fun addListener(l: EngineListener) = listeners.add(l)

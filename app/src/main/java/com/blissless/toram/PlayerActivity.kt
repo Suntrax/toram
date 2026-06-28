@@ -53,6 +53,10 @@ class PlayerActivity : ComponentActivity() {
         val saveFile = File(app.engine.getFileSavePath(fileIndex) ?: "")
         totalBytes = intent?.getLongExtra("file_size", 0) ?: 0
 
+        if (totalBytes <= 0) {
+            totalBytes = app.engine.getFileSize(fileIndex)
+        }
+
         engineListener = object : TorrentEngine.EngineListener {
             override fun onProgress(downloaded: Long, total: Long) {
                 runOnUiThread {
@@ -61,7 +65,16 @@ class PlayerActivity : ComponentActivity() {
                 }
             }
             override fun onFinished() {
-                runOnUiThread { playerReady = true }
+                // CRITICAL: When download finishes, start playback immediately.
+                // This is the fallback that ensures playback always starts
+                // once the file is fully downloaded.
+                runOnUiThread {
+                    if (!playerReady) {
+                        Log.d("PlayerActivity", "Download finished, starting playback")
+                        playerReady = true
+                        Toast.makeText(this@PlayerActivity, "Starting playback", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         }
         app.engine.addListener(engineListener!!)
@@ -75,14 +88,22 @@ class PlayerActivity : ComponentActivity() {
         }
 
         val server = TorrentStreamServer(saveDir)
-        server.setSafeBytesProvider { maxOf(downloadedBytes, 0L) }
-        server.setPieceSize(app.engine.getPieceSize())
+        server.setTotalFileSize(totalBytes)
+
+        // CRITICAL: Set the file's byte offset within the torrent.
+        // For multi-file torrents, the selected file doesn't start at
+        // piece 0. The server needs this to correctly map file positions
+        // to torrent-wide piece indices when checking piece availability.
+        server.setFileByteOffset(app.engine.getFileByteOffset(fileIndex))
+
+        server.setSafeBytesProvider { app.engine.getContiguousDownloadedBytes(fileIndex) }
+        server.setPieceSize(app.engine.getTorrentPieceLength())
         server.setPieceChecker { pieceIndex -> app.engine.havePiece(pieceIndex) }
         val port = server.start(0)
         streamServer = server
 
         val httpUrl = "http://127.0.0.1:$port/$encodedPath"
-        Log.d("PlayerActivity", "Stream URL: $httpUrl")
+        Log.d("PlayerActivity", "Stream URL: $httpUrl, totalSize: $totalBytes, fileByteOffset: ${app.engine.getFileByteOffset(fileIndex)}")
 
         setContent {
             ToramTheme {
@@ -96,25 +117,23 @@ class PlayerActivity : ComponentActivity() {
             }
         }
 
-        val numPieces = app.engine.getNumPieces()
-        val lastPiece = (numPieces - 1).coerceAtLeast(0)
-        val secondLastPiece = (lastPiece - 1).coerceAtLeast(0)
+        // Start playback as soon as we have ~1MB of contiguous data
+        // for the selected file. The onFinished() callback above
+        // serves as a fallback when the download completes.
+        val initialBufferBytes = 1L * 1024 * 1024 // 1MB
 
         pollHandler.post(object : Runnable {
             override fun run() {
-                val bytes = downloadedBytes
-                val headReady = bytes >= 256L * 1024
-                val tailReady = numPieces <= 1 ||
-                    (app.engine.havePiece(lastPiece) && (numPieces <= 2 || app.engine.havePiece(secondLastPiece)))
-                val threshold = if (totalBytes > 0) minOf(totalBytes, 10L * 1024 * 1024) else 10L * 1024 * 1024
-                val bytesReady = bytes >= threshold || (totalBytes > 0 && bytes >= totalBytes)
-                if ((headReady && tailReady) || bytesReady) {
-                    if (!playerReady) {
-                        playerReady = true
-                        Toast.makeText(this@PlayerActivity, "Starting playback", Toast.LENGTH_SHORT).show()
-                    }
+                if (playerReady) return // Already started
+
+                val contiguousBytes = app.engine.getContiguousDownloadedBytes(fileIndex)
+                Log.d("PlayerActivity", "Contiguous: $contiguousBytes bytes for file $fileIndex, threshold: $initialBufferBytes")
+
+                if (contiguousBytes >= initialBufferBytes || (totalBytes > 0 && contiguousBytes >= totalBytes)) {
+                    playerReady = true
+                    Toast.makeText(this@PlayerActivity, "Starting playback", Toast.LENGTH_SHORT).show()
                 } else {
-                    pollHandler.postDelayed(this, 400)
+                    pollHandler.postDelayed(this, 300)
                 }
             }
         })
