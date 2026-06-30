@@ -1,1 +1,1 @@
-torrent streaming app
+templated app used for torrent streaming implementation
